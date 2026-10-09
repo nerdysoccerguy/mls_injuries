@@ -1,1 +1,1 @@
-This file scrapes RotoWire for MLS unavailable/injured players and exports to Excel
+This code scrapes RotoWire for MLS unavailable/injured players and exports to Excel
