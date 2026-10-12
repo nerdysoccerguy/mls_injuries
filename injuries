@@ -1,4 +1,4 @@
-#Scrape MLS unavailable/injured players from RotoWire and export to Excel.
+#Scrapes MLS unavailable/injured players from RotoWire and export to Excel.
 
 from pathlib import Path
 import re
@@ -73,7 +73,7 @@ STATUS_ORDER = {
 
 
 def fetch_page(url: str) -> BeautifulSoup:
-    #Downloads and parse the RotoWire lineup page.
+    #Downloads and parses the RotoWire lineup page.
     try:
         response = requests.get(
             url,
@@ -121,7 +121,7 @@ def extract_match_datetime(game) -> tuple[str, str]:
 
 
 def extract_player_status(item) -> tuple[str, str, str]:
-    #Extract player name, status, and position from a lineup item.
+    #Extracts player name, status, and position from a lineup item.
     player_link = item.find("a")
     if player_link is None:
         return "", "", ""
@@ -163,7 +163,7 @@ def extract_player_status(item) -> tuple[str, str, str]:
 
 
 def extract_injuries(soup: BeautifulSoup) -> list[dict]:
-    #Extract unavailable/injured players from all MLS games.
+    #Extracts unavailable/injured players from all MLS games.
     injury_rows = []
     matches = soup.select("div.lineup.is-soccer")
 
