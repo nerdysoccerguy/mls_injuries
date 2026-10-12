@@ -1,0 +1,345 @@
+#Scrape MLS unavailable/injured players from RotoWire and export to Excel.
+
+from pathlib import Path
+import re
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+import os
+
+# Configuration
+SEASON_YEAR = 2026
+ROTO_WIRE_URL = "https://www.rotowire.com/soccer/lineups.php?league=MLS"
+DEFAULT_OUTPUT_FILE = (
+    Path.home()
+    / "Documents"
+    / "Spreadsheets"
+    / "mls_injured_players.xlsx"
+)
+
+OUTPUT_FILE = Path(
+    os.getenv("mls_injury_output", str(DEFAULT_OUTPUT_FILE))
+).expanduser()
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/152.0.0.0 Safari/537.36"
+    )
+}
+
+TEAM_NAME_MAP = {
+    "ATL": "Atlanta Utd",
+    "ATX": "Austin FC",
+    "CIN": "FC Cincinnati",
+    "CLB": "Columbus Crew",
+    "CLT": "Charlotte",
+    "DAL": "FC Dallas",
+    "DCU": "D.C. United",
+    "FIR": "Chicago Fire",
+    "GAL": "LA Galaxy",
+    "HOU": "Houston Dynamo",
+    "LAF": "LAFC",
+    "MIA": "Inter Miami",
+    "MNU": "Minnesota Utd",
+    "MTL": "CF Montréal",
+    "NER": "New England Revolution",
+    "NSH": "Nashville SC",
+    "NYC": "New York City FC",
+    "NYR": "Red Bull New York",
+    "ORL": "Orlando City",
+    "PHI": "Philadelphia Union",
+    "POR": "Portland Timbers",
+    "RAP": "Colorado Rapids",
+    "RSL": "Real Salt Lake",
+    "SD": "San Diego FC",
+    "SJE": "San Jose Earthquakes",
+    "STL": "St. Louis City",
+    "TOR": "Toronto FC",
+    "WHI": "Vancouver Whitecaps",
+    "SKC": "Sporting Kansas City",
+    "SOU": "Seattle Sounders",
+}
+
+STATUS_ORDER = {
+    "OUT": 1,
+    "SUS": 2,
+    "DOUBT": 3,
+    "QUES": 4,
+    "INJ": 5,
+}
+
+
+def fetch_page(url: str) -> BeautifulSoup:
+    #Downloads and parse the RotoWire lineup page.
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Failed to download RotoWire page: {exc}"
+        ) from exc
+
+    return BeautifulSoup(response.text, "html.parser")
+
+
+def extract_match_datetime(game) -> tuple[str, str]:
+    #Extract the match date and time from a RotoWire game element.
+    match_date = ""
+    match_time = ""
+
+    time_element = game.select_one(".lineup__time")
+    if not time_element:
+        return match_date, match_time
+
+    full_datetime = time_element.get_text(" ", strip=True)
+
+    datetime_match = re.search(
+        r"([A-Za-z]+ \d{1,2})\s+"
+        r"(\d{1,2}:\d{2}\s*[AP]M)",
+        full_datetime,
+        re.IGNORECASE,
+    )
+
+    if datetime_match:
+        match_date = f"{datetime_match.group(1)} {SEASON_YEAR}"
+        match_time = (
+            datetime_match.group(2)
+            .replace("  ", " ")
+            .strip()
+        )
+    else:
+        match_time = full_datetime
+
+    return match_date, match_time
+
+
+def extract_player_status(item) -> tuple[str, str, str]:
+    #Extract player name, status, and position from a lineup item.
+    player_link = item.find("a")
+    if player_link is None:
+        return "", "", ""
+
+    player_name = player_link.get(
+        "title",
+        player_link.get_text(" ", strip=True),
+    ).strip()
+
+    if not player_name:
+        return "", "", ""
+
+    full_text = item.get_text(" ", strip=True)
+
+    status = ""
+    status_match = re.search(
+        r"\b(OUT|QUES|SUS|DOUBT|INJ)\b",
+        full_text,
+        re.IGNORECASE,
+    )
+
+    if status_match:
+        status = status_match.group(1).upper()
+
+    position = ""
+    position_element = item.select_one(".lineup__pos")
+
+    if position_element:
+        position = position_element.get_text(" ", strip=True)
+    else:
+        position_match = re.match(
+            r"^(GK|G|D|M|F|D/M|M/D|F/M|M/F)",
+            full_text,
+        )
+        if position_match:
+            position = position_match.group(1)
+
+    return player_name, status, position
+
+
+def extract_injuries(soup: BeautifulSoup) -> list[dict]:
+    #Extract unavailable/injured players from all MLS games.
+    injury_rows = []
+    matches = soup.select("div.lineup.is-soccer")
+
+    print(f"Games found: {len(matches)}")
+
+    for game in matches:
+        teams = game.select(".lineup__team")
+        if len(teams) < 2:
+            continue
+
+        away_team = teams[0].get_text(" ", strip=True)
+        home_team = teams[1].get_text(" ", strip=True)
+        match_date, match_time = extract_match_datetime(game)
+
+        lineup_lists = game.select("ul.lineup__list")
+
+        for index, lineup in enumerate(lineup_lists[:2]):
+            if index == 0:
+                team = away_team
+                opponent = home_team
+                home_away = "Away"
+            else:
+                team = home_team
+                opponent = away_team
+                home_away = "Home"
+
+            in_injury_section = False
+
+            for item in lineup.find_all("li"):
+                text = item.get_text(" ", strip=True)
+                text_lower = text.lower()
+
+                if text_lower == "injuries":
+                    in_injury_section = True
+                    continue
+
+                if not in_injury_section:
+                    continue
+
+                if any(
+                    section in text_lower
+                    for section in (
+                        "predicted lineup",
+                        "confirmed lineup",
+                        "unknown lineup",
+                        "substitutes",
+                        "bench",
+                    )
+                ):
+                    break
+
+                player_name, status, position = extract_player_status(item)
+
+                if not player_name:
+                    continue
+
+                injury_rows.append(
+                    {
+                        "Date": match_date,
+                        "Time": match_time,
+                        "Team": team,
+                        "Opponent": opponent,
+                        "Home/Away": home_away,
+                        "Position": position,
+                        "Player": player_name,
+                        "Status": status,
+                    }
+                )
+
+    return injury_rows
+
+
+def create_unique_match(row: pd.Series) -> str:
+    #Creates the YYYY-MM-DD HOME TEAM AWAY TEAM match identifier.
+    if pd.isna(row["Date"]):
+        return ""
+
+    formatted_date = row["Date"].strftime("%Y-%m-%d")
+
+    if row["Home/Away"] == "Away":
+        home_team = row["Team"]
+        away_team = row["Opponent"]
+    else:
+        home_team = row["Opponent"]
+        away_team = row["Team"]
+
+    return f"{formatted_date} {home_team} {away_team}"
+
+
+def clean_data(injury_rows: list[dict]) -> pd.DataFrame:
+    #Cleans, transforms, sorts, and prepares injury data for export.
+    injuries_df = pd.DataFrame(injury_rows)
+
+    if injuries_df.empty:
+        return injuries_df
+
+    injuries_df = (
+        injuries_df
+        .drop_duplicates(
+            subset=["Date", "Team", "Player", "Status"]
+        )
+        .reset_index(drop=True)
+    )
+
+    injuries_df["Team"] = injuries_df["Team"].replace(TEAM_NAME_MAP)
+    injuries_df["Opponent"] = injuries_df["Opponent"].replace(
+        TEAM_NAME_MAP
+    )
+
+    injuries_df["Date"] = pd.to_datetime(
+        injuries_df["Date"],
+        errors="coerce",
+    )
+
+    injuries_df["Unique Match"] = injuries_df.apply(
+        create_unique_match,
+        axis=1,
+    )
+
+    injuries_df["Status Order"] = (
+        injuries_df["Status"]
+        .map(STATUS_ORDER)
+        .fillna(99)
+    )
+
+    injuries_df = (
+        injuries_df
+        .sort_values(
+            by=["Date", "Team", "Status Order", "Player"]
+        )
+        .drop(columns=["Status Order"])
+        .reset_index(drop=True)
+    )
+
+    injuries_df["Date"] = injuries_df["Date"].dt.strftime("%Y-%m-%d")
+
+    return injuries_df
+
+
+def export_to_excel(injuries_df: pd.DataFrame, output_file: Path) -> None:
+    #Exports the cleaned injury data to Excel.
+    try:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        injuries_df.to_excel(
+            output_file,
+            sheet_name="Unavailable Players",
+            index=False,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Failed to create Excel file: {exc}"
+        ) from exc
+
+
+def main() -> None:
+    #Runs the MLS unavailable-player scraper.
+    soup = fetch_page(ROTO_WIRE_URL)
+    injury_rows = extract_injuries(soup)
+    injuries_df = clean_data(injury_rows)
+
+    if injuries_df.empty:
+        print()
+        print("No unavailable/injured players were found.")
+        return
+
+    print()
+    print("MLS UNAVAILABLE / INJURED PLAYERS")
+    print()
+    print(injuries_df.to_string(index=False))
+
+    export_to_excel(injuries_df, OUTPUT_FILE)
+
+    print()
+    print("Excel file created successfully:")
+    print(OUTPUT_FILE)
+
+
+if __name__ == "__main__":
+    main()
